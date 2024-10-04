@@ -465,6 +465,45 @@ class DebugFormatter:
                 fd.write(node.debug_str())
                 fd.write("\n\n\n")
 
+    def ir_with_origin_info_pre_fusion(self, nodes_with_origin):
+        self._write_ir_with_origin("ir_with_origin_pre_fusion.txt", nodes_with_origin)
+
+    def ir_with_origin_info_post_fusion(self, nodes_with_origin):
+        self._write_ir_with_origin("ir_with_origin_post_fusion.txt", nodes_with_origin)
+
+    def _write_ir_with_origin(self, filename: str, nodes_with_origin):
+        with self.fopen(filename) as fd:
+            log.info("Writing debug ir to  %s", fd.name)
+            for node in nodes_with_origin:
+                fd.write(f"{node['node'].get_name()}\n")
+                stack_traces = node['stack_traces']
+                for st in stack_traces:
+                    fd.write(f"{st}\n")
+                    for orig in stack_traces[st]:
+                        if orig.name:
+                            fd.write(f"{orig.name}\n")
+                fd.write("\n")
+
+                    # if origin.name:
+                    #     fd.write(origin.name)
+                    #     fd.write("\n")
+                    # fd.write(node['stack_trace'])
+                    # fd.write("\n")
+
+    def write_ir_dot_graphs(self):
+        dest_path = self.handler._path
+        from .ir_graph import GRAPH_OUTPUT_PATH
+        # copy the file in GRAPH_OUTPUT_PATH to dest_path
+        if os.path.exists(GRAPH_OUTPUT_PATH):
+            for file in os.listdir(GRAPH_OUTPUT_PATH):
+                shutil.copy(os.path.join(GRAPH_OUTPUT_PATH, file), dest_path)
+
+    def write_fusion_fault_report(self):
+        dest_path = self.handler._path
+        from .fault_loc import FUSION_DEBUG_PATH, FAULT_REPORT_FILE
+        if os.path.exists(f"{FUSION_DEBUG_PATH}/{FAULT_REPORT_FILE}"):
+            shutil.copy(f"{FUSION_DEBUG_PATH}/{FAULT_REPORT_FILE}", dest_path)
+
     def graph_diagram(self, nodes: SchedulerNodeList):
         draw_buffers(nodes, fname=self.filename("graph_diagram.svg"))
 

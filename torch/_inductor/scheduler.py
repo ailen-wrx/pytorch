@@ -1232,6 +1232,11 @@ class Scheduler:
         if config.reorder_for_compute_comm_overlap:
             comms.decide_global_ordering_of_comms(self.nodes)
         self.compute_ancestors()
+        
+        # Origin mapping before scheduling
+        origin_mapping_pre_fusion = self.get_origin_mapping()
+        graph_with_origin_pre_fusion = self.get_ir_graph()
+        graph_with_origin_pre_fusion.print_graph("graph-pre-fusion")
 
         metrics.ir_nodes_pre_fusion += len(self.nodes)
         V.debug.ir_pre_fusion(self.nodes)
@@ -1240,6 +1245,8 @@ class Scheduler:
         self.create_foreach_nodes()
         self.topological_sort_schedule()
         self.logged_slow_fusion = set()
+        if config.fusion_fault:
+            self.create_fault_report()
         self.fuse_nodes()
         if config.reorder_for_compute_comm_overlap:
             # Refresh node_users and inverse_users to reflect fused nodes
@@ -1249,6 +1256,24 @@ class Scheduler:
         V.debug.ir_post_fusion(self.nodes)
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
+
+        # Origin mapping after scheduling
+        origin_mapping_after_scheduling = self.get_origin_mapping()
+        graph_with_origin_post_fusion = self.get_ir_graph()
+        graph_with_origin_post_fusion.print_graph("graph-post-fusion")
+
+        # Output the origin-mapped nodes
+        V.debug.ir_with_origin_info_pre_fusion(origin_mapping_pre_fusion)
+        V.debug.ir_with_origin_info_post_fusion(origin_mapping_after_scheduling)
+
+        # Output the origin-mapped IR graph
+        V.debug.write_ir_dot_graphs()
+
+        # Output the fusion fault report (if any)
+        if config.fusion_fault:
+            V.debug.write_fusion_fault_report()
+
+        graph_with_origin_pre_fusion.diff(graph_with_origin_post_fusion)
 
         # used during codegen:
         self.current_device: torch.device = None  # type: ignore[assignment]
@@ -1570,17 +1595,42 @@ class Scheduler:
         for order, node in enumerate(self.nodes):
             node.min_order = order
             node.max_order = order
+        
+    def create_fault_report(self):
+        from .fault_loc import FUSION_DEBUG_PATH, FAULT_REPORT_FILE
+        if not os.path.exists(FUSION_DEBUG_PATH):
+            os.makedirs(FUSION_DEBUG_PATH)
+        with open(f"{FUSION_DEBUG_PATH}/{FAULT_REPORT_FILE}", "w") as f:
+            f.write("")
+
+    def dump_fault(self, round_idx, idx, node1, node2, node3):
+        from .fault_loc import FUSION_DEBUG_PATH, FAULT_REPORT_FILE
+        with open(f"{FUSION_DEBUG_PATH}/{FAULT_REPORT_FILE}", "a") as f:
+            f.write(f"{round_idx}, {idx}, {node1.get_name()}, {node2.get_name()}, {node3.get_name()}")
+            f.write("\n")
+
+    def dump_metadata(self, data):
+        from .fault_loc import FUSION_DEBUG_PATH, METADATA_FILE
+        if not os.path.exists(FUSION_DEBUG_PATH):
+            os.makedirs(FUSION_DEBUG_PATH)
+        with open(f"{FUSION_DEBUG_PATH}/{METADATA_FILE}", "w") as f:
+            for n in data:
+                f.write(f"{n}\n")
 
     def fuse_nodes(self):
         """
         Mutates self.nodes to combine nodes into FusedSchedulerNodes.
         """
+        fusion_metadata = []
         for i in range(10):
+            if config.debug_fusion and i > config.fusion_round_idx:
+                break
             old_len = len(self.nodes)
             fusion_log.debug(
                 "===== attempting fusion (%d/10): %d nodes =====", i + 1, old_len
             )
-            self.fuse_nodes_once()
+            fusion_metadata.append(len(self.get_possible_fusions()))
+            self.fuse_nodes_once(i)
             new_len = len(self.nodes)
             fusion_log.debug(
                 "completed fusion round (%d/10): fused %d nodes into %d nodes\n",
@@ -1591,6 +1641,8 @@ class Scheduler:
             if new_len == old_len or new_len == 1:
                 fusion_log.debug("===== fusion complete (%d iterations) =====", i + 1)
                 break
+        if config.record_fusion:
+            self.dump_metadata(fusion_metadata)
 
     def benchmark_fused_nodes(self, nodes):
         """
@@ -1700,7 +1752,7 @@ class Scheduler:
             )
         return ms_fused < ms1 + ms2
 
-    def fuse_nodes_once(self):
+    def fuse_nodes_once(self, round_idx):
         """
         Mutates self.nodes to combine nodes into FusedSchedulerNodes.
 
@@ -1708,8 +1760,13 @@ class Scheduler:
             - self.can_fuses(): checks if a fusion is legal
             - self.score_fusion(): assigns priority to a given fusion
         """
+        start_idx = config.fusion_start_idx
+        end_idx = config.fusion_end_idx
         fused_nodes = set(self.nodes)
-        for node1, node2 in self.get_possible_fusions():
+        for idx, possible_fusion in enumerate(self.get_possible_fusions()):
+            if config.debug_fusion and round_idx == config.fusion_round_idx and (idx < start_idx or idx >= end_idx):
+                continue
+            node1, node2 = possible_fusion
             node1 = self.name_to_fused_node[node1.get_first_name()]
             node2 = self.name_to_fused_node[node2.get_first_name()]
             if self.can_fuse(node1, node2) and not self.will_fusion_create_cycle(
@@ -1724,6 +1781,8 @@ class Scheduler:
                 self.name_to_fused_node.update(
                     {n.get_name(): node3 for n in node3.get_nodes()}
                 )
+                if config.fusion_fault and (round_idx, idx) in config.fusion_fault:
+                    self.dump_fault(round_idx, idx, node1, node2, node3)
         self.nodes = sorted(fused_nodes, key=lambda x: x.min_order)
         self.topological_sort_schedule()
         self.prune_redundant_deps()
@@ -2240,6 +2299,47 @@ class Scheduler:
             return not layout.maybe_guard_aligned()
         else:
             return False
+        
+    def get_origin_mapping(self):
+        origin_to_index = {}
+        node_list = []
+        def get_order(n):
+            if n not in origin_to_index:
+                origin_to_index.update({n: i for i, n in enumerate(n.graph.nodes)})
+            return origin_to_index[n]
+        
+        lowered_ops = []
+        for node in self.nodes:
+            origins = [(get_order(e), e) for n in node.get_nodes() for e in n.node.origins]
+            if origins:
+                _origins = []
+                _stack_traces = {}
+                for idx, op in sorted(origins):
+                    if op in lowered_ops and len(origins) > 1:
+                        continue
+                    lowered_ops.append(op)
+                    st = '<unavailable>'
+                    if 'stack_trace' in op.meta:
+                        st = str(op.meta['stack_trace']).strip()
+                    elif 'val' in op.meta:
+                        st = str(op.meta['val']).strip()
+                    _origins.append(op)
+                    if st not in _stack_traces:
+                        _stack_traces[st] = [op]
+                    else:
+                        _stack_traces[st].append(op)
+                    _stack_traces[st] = _stack_traces.pop(st)
+                node_list.append({
+                    'node': node,
+                    'origins': _origins,
+                    'stack_traces': _stack_traces,
+                })
+        return node_list
+
+    def get_ir_graph(self):
+        from .ir_graph import IRGraph
+        graph = IRGraph(self.nodes)
+        return graph
 
 
 class BaseScheduling:

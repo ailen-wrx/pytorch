@@ -268,6 +268,19 @@ always_keep_tensor_constants = False
 # assert that indirect indexing does not read / write out of bounds
 assert_indirect_indexing = True
 
+# log fusion info for debugging
+record_fusion = os.environ.get("TORCHINDUCTOR_RECORD_FUSION") == "1"
+debug_fusion = os.environ.get("TORCHINDUCTOR_DEBUG_FUSION") == "1"
+
+# control fusion for debugging
+fusion_round_idx = int(os.environ.get("TORCHINDUCTOR_FUSION_ROUND")) \
+    if os.environ.get("TORCHINDUCTOR_FUSION_ROUND") else -1
+fusion_start_idx = int(os.environ.get("TORCHINDUCTOR_FUSION_START")) \
+    if os.environ.get("TORCHINDUCTOR_FUSION_START") else -1
+fusion_end_idx = int(os.environ.get("TORCHINDUCTOR_FUSION_END")) \
+    if os.environ.get("TORCHINDUCTOR_FUSION_END") else -1
+fusion_fault = None
+
 
 def is_fbcode():
     return not hasattr(torch.version, "git_version")
@@ -622,6 +635,12 @@ class trace:
 
     # Save TorchInductor IR after fusion pass
     ir_post_fusion = True
+
+    # Save the ir nodes with origin information
+    ir_with_origin_info_pre_fusion = True
+    ir_with_origin_info_post_fusion = True
+    write_ir_dot_graphs = True
+    write_fusion_fault_report = True
 
     # Copy generated code to trace dir
     output_code = True

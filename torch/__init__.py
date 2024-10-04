@@ -1826,6 +1826,21 @@ def compile(model: Optional[Callable] = None, *,
     return torch._dynamo.optimize(backend=backend, nopython=fullgraph, dynamic=dynamic, disable=disable)(model)
 
 
+
+def compiler_debug(model: Optional[Callable] = None,
+                   backend: Union[str, Callable] = "inductor",
+                   args: Optional[List] = None,
+                   mode: Optional[str] = "brute-force",):
+
+    if backend == "inductor":
+        from torch._inductor.fault_loc import fault_loc
+        debugger = fault_loc(model, args, mode)
+        if debugger.has_fault():
+            debugger.diagnose()
+
+    return None
+
+
 from torch import export as export
 
 from torch._higher_order_ops import cond
